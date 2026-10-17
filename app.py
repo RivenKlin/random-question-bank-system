@@ -193,4 +193,4 @@ def review(kind):
     table='wrong_questions' if kind=='wrong' else 'favorites'; order_col='updated_at' if kind=='wrong' else 'created_at'; c=db(); rows=c.execute(f'SELECT q.*,1 as {kind} FROM questions q JOIN {table} x ON x.question_id=q.id ORDER BY x.{order_col} DESC').fetchall(); c.close(); return jsonify([qdict(r,False) for r in rows])
 @app.route('/api/records')
 def records(): return jsonify([dict(r) for r in db().execute('SELECT * FROM records ORDER BY id DESC LIMIT 50').fetchall()])
-if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT',5000)),debug=False)
+if __name__=='__main__': app.run(host=os.environ.get('HOST','127.0.0.1'),port=int(os.environ.get('PORT',5000)),debug=False)

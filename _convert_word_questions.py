@@ -132,7 +132,7 @@ def load_total_questions(path):
             if typ == '判断' and not opts:
                 opts = {'T': '对', 'F': '错'}
             result[typ].append({'type': typ, 'question': question, 'answer': answer,
-                                'options': opts, 'chapter': clean(vals.get('group')), 
+                                'options': opts, 'chapter': clean(vals.get('group')),
                                 'explanation': clean(vals.get('attachment'))})
     return result
 

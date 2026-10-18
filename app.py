@@ -1,6 +1,6 @@
-import os, re, json, random, sqlite3, secrets
+import os, re, json, random, sqlite3, secrets, csv, io
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, session
+from flask import Flask, request, jsonify, send_from_directory, session, send_file
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from openpyxl import load_workbook
@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS progress (
  user_id INTEGER NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL,
  PRIMARY KEY(user_id, device_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS import_batches (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, file_name TEXT DEFAULT '', imported INTEGER DEFAULT 0,
+ skipped INTEGER DEFAULT 0, duplicates INTEGER DEFAULT 0, created_at TEXT NOT NULL, admin_id INTEGER,
+ FOREIGN KEY(admin_id) REFERENCES users(id) ON DELETE SET NULL
+);
 '''
 
 def db():
@@ -43,6 +48,29 @@ def normalize_answer(v, qtype):
     if qtype == '判断':
         return {'T':'对','F':'错','TRUE':'对','FALSE':'错','Y':'对','N':'错'}.get(s, s)
     return ''.join(sorted(set(re.findall('[A-E]', s))))
+
+def validate_question_payload(data):
+    if not isinstance(data, dict): return None, '题目格式无效'
+    qtype, question = clean(data.get('type')), clean(data.get('question'))
+    if qtype not in ('单选', '多选', '判断'): return None, '题型无效'
+    if not question: return None, '题干不能为空'
+    answer = normalize_answer(data.get('answer'), qtype)
+    options = data.get('options') if isinstance(data.get('options'), dict) else {}
+    options = {str(k).upper(): clean(v) for k, v in options.items() if str(k).upper() in 'ABCDE' and clean(v)}
+    if qtype == '判断':
+        options = options or {'T': '对', 'F': '错'}
+        if answer not in ('对', '错'): return None, '判断题答案必须为对或错'
+    else:
+        if not answer or any(key not in options for key in answer): return None, '选择题答案必须对应已有选项'
+        if qtype == '单选' and len(answer) != 1: return None, '单选题只能有一个答案'
+    normalized = dict(data, type=qtype, question=question, answer=answer, options=options)
+    return normalized, None
+
+def question_fingerprint(data):
+    q, _ = validate_question_payload(data)
+    if not q: return None
+    return json.dumps([q['type'], q['question'], sorted(q['options'].items()), q['answer']], ensure_ascii=False, separators=(',', ':'))
+
 def row_question(row, headers, qtype, source):
     vals = {headers[i]: row[i] if i < len(row) else None for i in range(len(headers))}
     question = clean(vals.get('question') or vals.get('题目') or vals.get('问题'))
@@ -57,9 +85,9 @@ def row_question(row, headers, qtype, source):
     return (qtype, chapter, clean(vals.get('score')) or '1', clean(vals.get('level')), question, ans, json.dumps(options, ensure_ascii=False), explanation, os.path.basename(source), now(), now())
 
 def import_excel(clear=False):
-    conn = db(); conn.executescript(SCHEMA)
+    conn = db(); conn.executescript(SCHEMA); conn.execute('BEGIN')
     if clear: conn.execute('DELETE FROM questions')
-    count, skipped, files = 0, 0, 0
+    count, skipped, duplicates, files = 0, 0, 0, 0; fingerprints = existing_fingerprints(conn)
     for path in sorted([os.path.join(DATA_DIR, x) for x in os.listdir(DATA_DIR) if x.lower().endswith('.xlsx')]):
         files += 1
         try: wb = load_workbook(path, read_only=True, data_only=True)
@@ -72,10 +100,16 @@ def import_excel(clear=False):
             except StopIteration: continue
             for row in rows:
                 item = row_question(row, headers, qtype, path)
-                if item:
-                    conn.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', item); count += 1
-                else: skipped += 1
-    conn.commit(); conn.close(); return {'files':files,'imported':count,'skipped':skipped}
+                if not item: skipped += 1; continue
+                payload={'type':item[0],'chapter':item[1],'score':item[2],'level':item[3],'question':item[4],'answer':item[5],'options':json.loads(item[6]),'explanation':item[7]}
+                normalized, error = validate_question_payload(payload)
+                if error: skipped += 1; continue
+                fp=question_fingerprint(normalized)
+                if not fp or fp in fingerprints: duplicates += 1; continue
+                fingerprints.add(fp)
+                conn.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', (normalized['type'], normalized.get('chapter') or '未分类', normalized.get('score', 1), normalized.get('level', ''), normalized['question'], normalized['answer'], json.dumps(normalized['options'], ensure_ascii=False), normalized.get('explanation', ''), item[8], item[9], item[10]))
+                count += 1
+    record_import(conn, '服务器题库目录', '', count, skipped, duplicates); conn.commit(); conn.close(); return {'files':files,'imported':count,'skipped':skipped,'duplicates':duplicates}
 
 def ensure_db():
     conn = db()
@@ -102,12 +136,6 @@ def ensure_db():
         conn.execute('INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)', ('admin', generate_password_hash(os.environ.get('ADMIN_PASSWORD', 'admin123')), 'admin', now()))
     conn.execute("UPDATE questions SET chapter=COALESCE(NULLIF(source,''),'未分类') WHERE chapter IS NULL OR TRIM(chapter)='' OR LOWER(chapter)='undefined'")
     conn.commit()
-    n = conn.execute('SELECT COUNT(*) c FROM questions').fetchone()['c']
-    missing = conn.execute("SELECT COUNT(*) c FROM questions WHERE options IS NULL OR options='{}' OR options=''").fetchone()['c']
-    if n == 0:
-        conn.close()
-        import_excel(clear=False)
-        conn = db()
     conn.execute("UPDATE questions SET options=? WHERE type='判断' AND (options IS NULL OR options='{}' OR options='')", (json.dumps({'T':'对','F':'错'}, ensure_ascii=False),))
     conn.commit(); conn.close()
 ensure_db()
@@ -117,6 +145,12 @@ def qdict(row, include_answer=True):
     d['is_favorite'] = bool(d.pop('favorite', 0)); d['is_wrong'] = bool(d.pop('wrong', 0))
     if not include_answer: d.pop('answer', None); d.pop('explanation', None)
     return d
+
+def existing_fingerprints(conn):
+    return {question_fingerprint({'type': r['type'], 'question': r['question'], 'answer': r['answer'], 'options': json.loads(r['options'] or '{}')}) for r in conn.execute('SELECT type,question,answer,options FROM questions')}
+
+def record_import(conn, source, file_name, imported, skipped, duplicates):
+    conn.execute('INSERT INTO import_batches(source,file_name,imported,skipped,duplicates,created_at,admin_id) VALUES(?,?,?,?,?,?,?)', (source, file_name, imported, skipped, duplicates, now(), session.get('user_id')))
 
 def login_required(admin_only=False):
     def decorate(fn):
@@ -194,13 +228,25 @@ def progress():
     c = db()
     if request.method == 'GET':
         row = c.execute('SELECT state FROM progress WHERE user_id=? AND device_id=?', (user_id, device_id)).fetchone()
-        c.close()
         if not row:
+            c.close()
             return jsonify({'state': None})
         try:
-            return jsonify({'state': json.loads(row['state'])})
+            state = json.loads(row['state'])
         except json.JSONDecodeError:
+            c.close()
             return jsonify({'state': None})
+        if isinstance(state, dict) and isinstance(state.get('qs'), list):
+            ids = [item.get('id') for item in state['qs'] if isinstance(item, dict) and isinstance(item.get('id'), int)]
+            if ids:
+                placeholders = ','.join('?' * len(ids))
+                existing = {r['id'] for r in c.execute(f'SELECT id FROM questions WHERE id IN ({placeholders})', ids)}
+                state['qs'] = [item for item in state['qs'] if isinstance(item, dict) and item.get('id') in existing]
+                state['answers'] = {str(key): value for key, value in (state.get('answers') or {}).items() if str(key).isdigit() and int(key) in existing} if isinstance(state.get('answers'), dict) else {}
+            else:
+                state['qs'] = []
+        c.close()
+        return jsonify({'state': state})
     if request.method == 'DELETE':
         c.execute('DELETE FROM progress WHERE user_id=? AND device_id=?', (user_id, device_id))
     else:
@@ -227,17 +273,54 @@ def questions():
     if types: where.append('type IN (%s)' % ','.join('?' * len(types))); args += types
     elif typ: where.append('type=?'); args.append(typ)
     if chapter: where.append('chapter=?'); args.append(chapter)
-    sql='SELECT * FROM questions WHERE '+(' AND '.join(where) if where else '1=1')+' ORDER BY id DESC LIMIT 500'; rows=c.execute(sql,args).fetchall(); c.close(); return jsonify([qdict(r) for r in rows])
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+        page_size = min(100, max(1, int(request.args.get('page_size', 50))))
+    except (TypeError, ValueError):
+        c.close()
+        return jsonify({'error': '分页参数无效'}), 400
+    offset = (page - 1) * page_size
+    condition=' AND '.join(where) if where else '1=1'
+    sql='SELECT * FROM questions WHERE '+condition+' ORDER BY id DESC LIMIT ? OFFSET ?'; rows=c.execute(sql,args+[page_size,offset]).fetchall()
+    total=c.execute('SELECT COUNT(*) n FROM questions WHERE '+condition,args).fetchone()['n']; c.close()
+    return jsonify({'items':[qdict(r) for r in rows],'total':total,'page':page,'page_size':page_size})
+@app.route('/api/questions/clear', methods=['POST'])
+@login_required(admin_only=True)
+def clear_questions():
+    c = db()
+    count = c.execute('SELECT COUNT(*) n FROM questions').fetchone()['n']
+    c.execute('DELETE FROM questions')
+    c.commit()
+    c.close()
+    return jsonify({'ok': True, 'deleted': count})
+
 @app.route('/api/questions/<int:qid>', methods=['POST','PUT','DELETE'])
 @login_required(admin_only=True)
 def question_detail(qid):
     c=db()
     if request.method=='DELETE': c.execute('DELETE FROM questions WHERE id=?',(qid,)); c.commit(); c.close(); return jsonify({'ok':True})
-    data=request.json or {}; typ=data.get('type','单选'); options=data.get('options',{})
-    fields=(typ, data.get('chapter','未分类'), data.get('score',1), data.get('level',''), data.get('question',''), normalize_answer(data.get('answer',''),typ), json.dumps(options,ensure_ascii=False), data.get('explanation',''), data.get('source','手工录入'), now())
-    if request.method=='POST': c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',fields)
+    data=request.get_json(silent=True) or {}; normalized, error = validate_question_payload(data)
+    if error: c.close(); return jsonify({'error': error}), 400
+    if request.method == 'PUT' and c.execute('SELECT 1 FROM questions WHERE id=?', (qid,)).fetchone() is None:
+        c.close(); return jsonify({'error': '题目不存在'}), 404
+    fields=(normalized['type'], clean(normalized.get('chapter')) or '未分类', normalized.get('score',1), clean(normalized.get('level')), normalized['question'], normalized['answer'], json.dumps(normalized['options'],ensure_ascii=False), clean(normalized.get('explanation')), clean(normalized.get('source')) or '手工录入', now(), now())
+    if request.method=='POST': c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',fields)
     else: c.execute('UPDATE questions SET type=?,chapter=?,score=?,level=?,question=?,answer=?,options=?,explanation=?,source=?,updated_at=? WHERE id=?',fields+(qid,))
     c.commit(); c.close(); return jsonify({'ok':True})
+
+@app.route('/api/questions/batch-delete', methods=['POST'])
+@login_required(admin_only=True)
+def batch_delete():
+    ids = (request.get_json(silent=True) or {}).get('ids', [])
+    if not isinstance(ids, list) or not ids or len(ids) > 200 or not all(isinstance(x, int) for x in ids): return jsonify({'error':'ids数量无效'}), 400
+    c=db(); c.execute('BEGIN'); c.executemany('DELETE FROM questions WHERE id=?', [(x,) for x in set(ids)]); deleted=c.total_changes; c.commit(); c.close(); return jsonify({'ok':True,'deleted':deleted})
+
+@app.route('/api/questions/batch-update', methods=['POST'])
+@login_required(admin_only=True)
+def batch_update():
+    data=request.get_json(silent=True) or {}; ids=data.get('ids', []); chapter=clean(data.get('chapter'))
+    if not isinstance(ids,list) or not ids or len(ids)>200 or not chapter: return jsonify({'error':'ids或章节无效'}), 400
+    c=db(); c.execute('BEGIN'); c.executemany('UPDATE questions SET chapter=?,updated_at=? WHERE id=?', [(chapter,now(),x) for x in set(ids)]); updated=c.total_changes; c.commit(); c.close(); return jsonify({'ok':True,'updated':updated})
 @app.route('/api/import', methods=['POST'])
 @login_required(admin_only=True)
 def do_import(): return jsonify(import_excel(bool((request.json or {}).get('clear'))))
@@ -245,54 +328,115 @@ def do_import(): return jsonify(import_excel(bool((request.json or {}).get('clea
 @app.route('/api/import-mapped', methods=['POST'])
 @login_required(admin_only=True)
 def import_mapped():
-    data = request.get_json(silent=True) or {}
-    questions = data.get('questions')
-    if not isinstance(questions, list):
-        return jsonify({'error': 'questions must be a list'}), 400
-    c = db(); imported = skipped = 0
-    try:
-        for item in questions:
-            if not isinstance(item, dict):
-                skipped += 1; continue
-            qtype = item.get('type')
-            question = clean(item.get('question'))
-            answer = normalize_answer(item.get('answer'), qtype)
-            if qtype not in ('单选', '多选', '判断') or not question or not answer:
-                skipped += 1; continue
-            options = item.get('options') if isinstance(item.get('options'), dict) else {}
-            if qtype == '判断' and not options:
-                options = {'T': '对', 'F': '错'}
-            c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', (qtype, clean(item.get('chapter')) or '未分类', 1, '', question, answer, json.dumps(options, ensure_ascii=False), clean(item.get('explanation')), '上传Excel（字段映射）', now(), now()))
-            imported += 1
-        c.commit()
-    except Exception:
-        c.rollback(); c.close(); raise
-    c.close()
-    return jsonify({'imported': imported, 'skipped': skipped})
+    data = request.get_json(silent=True) or {}; questions = data.get('questions')
+    if not isinstance(questions, list): return jsonify({'error': 'questions must be a list'}), 400
+    c = db(); imported = skipped = duplicates = 0; fingerprints = existing_fingerprints(c); c.execute('BEGIN')
+    for item in questions:
+        normalized, error = validate_question_payload(item)
+        if error: skipped += 1; continue
+        fp=question_fingerprint(normalized)
+        if fp in fingerprints: duplicates += 1; continue
+        fingerprints.add(fp)
+        c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', (normalized['type'], clean(normalized.get('chapter')) or '未分类', normalized.get('score',1), clean(normalized.get('level')), normalized['question'], normalized['answer'], json.dumps(normalized['options'], ensure_ascii=False), clean(normalized.get('explanation')), '上传Excel（字段映射）', now(), now())); imported += 1
+    record_import(c, '上传Excel（字段映射）', clean(data.get('file_name')), imported, skipped, duplicates); c.commit(); c.close()
+    return jsonify({'imported': imported, 'skipped': skipped, 'duplicates': duplicates})
 
 @app.route('/api/upload-import', methods=['POST'])
 @login_required(admin_only=True)
 def upload_import():
-    files=request.files.getlist('files'); chapter=clean(request.form.get('chapter')); count=skipped=0
-    for file in files:
-        if not file.filename or not file.filename.lower().endswith('.xlsx'): skipped+=1; continue
-        try: wb=load_workbook(file,read_only=True,data_only=True)
-        except Exception: skipped+=1; continue
-        c=db()
-        for ws in wb.worksheets:
-            qtype={'choice':'单选','mchoice':'多选','judgement':'判断'}.get(ws.title.lower())
-            if not qtype: continue
-            rows=ws.iter_rows(values_only=True)
-            try: headers=[clean(x).lower() for x in next(rows)]
-            except StopIteration: continue
-            for row in rows:
-                item=row_question(row,headers,qtype,file.filename)
-                if item:
-                    if chapter and not (clean(row[headers.index('chapter')]) if 'chapter' in headers and headers.index('chapter')<len(row) else clean(row[headers.index('章节')]) if '章节' in headers and headers.index('章节')<len(row) else ''): item=(item[0],chapter)+item[2:]
-                    c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',item); count+=1
-                else: skipped+=1
-        c.commit(); c.close()
-    return jsonify({'files':len(files),'imported':count,'skipped':skipped})
+    files = request.files.getlist('files')
+    chapter = clean(request.form.get('chapter'))
+    count = skipped = duplicates = 0
+    file_names = []
+    c = db()
+    fingerprints = existing_fingerprints(c)
+
+    try:
+        c.execute('BEGIN')
+        for file in files:
+            filename = clean(file.filename)
+            if not filename or not filename.lower().endswith('.xlsx'):
+                skipped += 1
+                continue
+            file_names.append(filename)
+            try:
+                wb = load_workbook(file, read_only=True, data_only=True)
+            except Exception:
+                skipped += 1
+                continue
+
+            for ws in wb.worksheets:
+                qtype = {'choice': '单选', 'mchoice': '多选', 'judgement': '判断'}.get(ws.title.lower())
+                if not qtype:
+                    continue
+                rows = ws.iter_rows(values_only=True)
+                try:
+                    headers = [clean(x).lower() for x in next(rows)]
+                except StopIteration:
+                    continue
+
+                for row in rows:
+                    item = row_question(row, headers, qtype, filename)
+                    if not item:
+                        skipped += 1
+                        continue
+                    has_chapter = (
+                        clean(row[headers.index('chapter')])
+                        if 'chapter' in headers and headers.index('chapter') < len(row)
+                        else clean(row[headers.index('章节')])
+                        if '章节' in headers and headers.index('章节') < len(row)
+                        else ''
+                    )
+                    if chapter and not has_chapter:
+                        item = (item[0], chapter) + item[2:]
+                    payload = {
+                        'type': item[0], 'chapter': item[1], 'score': item[2],
+                        'level': item[3], 'question': item[4], 'answer': item[5],
+                        'options': json.loads(item[6]), 'explanation': item[7]
+                    }
+                    normalized, error = validate_question_payload(payload)
+                    if error:
+                        skipped += 1
+                        continue
+                    fingerprint = question_fingerprint(normalized)
+                    if not fingerprint or fingerprint in fingerprints:
+                        duplicates += 1
+                        continue
+                    fingerprints.add(fingerprint)
+                    c.execute(
+                        'INSERT INTO questions('
+                        'type,chapter,score,level,question,answer,options,'
+                        'explanation,source,created_at,updated_at'
+                        ') VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                        (
+                            normalized['type'],
+                            normalized.get('chapter') or '未分类',
+                            normalized.get('score', 1),
+                            normalized.get('level', ''),
+                            normalized['question'],
+                            normalized['answer'],
+                            json.dumps(normalized['options'], ensure_ascii=False),
+                            normalized.get('explanation', ''),
+                            item[8], item[9], item[10]
+                        )
+                    )
+                    count += 1
+
+        record_import(
+            c, '上传Excel', ', '.join(file_names), count, skipped, duplicates
+        )
+        c.commit()
+    except Exception:
+        c.rollback()
+        c.close()
+        raise
+    c.close()
+    return jsonify({
+        'files': len(files),
+        'imported': count,
+        'skipped': skipped,
+        'duplicates': duplicates
+    })
 @app.route('/api/quiz', methods=['POST'])
 @login_required()
 def quiz():
@@ -325,6 +469,7 @@ def submit():
         if not r: continue
         got=normalize_answer(answers.get(str(qid),answers.get(qid,'')),r['type']); ok=got==r['answer']; correct += ok
         if not ok: c.execute('INSERT INTO wrong_questions(user_id,question_id,wrong_count,last_answer,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id,question_id) DO UPDATE SET wrong_count=wrong_count+1,last_answer=excluded.last_answer,updated_at=excluded.updated_at',(session['user_id'],qid,1,got,now()))
+        else: c.execute('DELETE FROM wrong_questions WHERE user_id=? AND question_id=?', (session['user_id'], qid))
         result.append({'id':qid,'correct':ok,'answer':r['answer'],'explanation':r['explanation'],'user_answer':got})
     score=round(sum(float(c.execute('SELECT score FROM questions WHERE id=?',(x,)).fetchone()['score'] or 1) for x in ids if any(z['id']==x and z['correct'] for z in result)),2)
     c.execute('INSERT INTO records(user_id,mode,total,correct,score,question_ids,answers,created_at) VALUES(?,?,?,?,?,?,?,?)',(session['user_id'],d.get('mode','练习'),len(ids),correct,score,json.dumps(ids),json.dumps(answers,ensure_ascii=False),now())); c.commit(); c.close(); return jsonify({'total':len(ids),'correct':correct,'score':score,'results':result})
@@ -339,6 +484,82 @@ def favorite(qid):
 def review(kind):
     if kind not in ('wrong','favorite'): return jsonify([]),400
     table='wrong_questions' if kind=='wrong' else 'favorites'; order_col='updated_at' if kind=='wrong' else 'created_at'; c=db(); rows=c.execute(f'SELECT q.*,1 as {kind} FROM questions q JOIN {table} x ON x.question_id=q.id WHERE x.user_id=? ORDER BY x.{order_col} DESC',(session['user_id'],)).fetchall(); c.close(); return jsonify([qdict(r,False) for r in rows])
+@app.route('/api/questions/export')
+@login_required(admin_only=True)
+def export_questions():
+    fmt=clean(request.args.get('format')).lower() or 'json'; c=db(); where=[]; args=[]
+    search=clean(request.args.get('search')); chapter=clean(request.args.get('chapter')); types=request.args.getlist('types')
+    if search: where.append('(question LIKE ? OR chapter LIKE ?)'); args += [f'%{search}%', f'%{search}%']
+    if chapter: where.append('chapter=?'); args.append(chapter)
+    if types: where.append('type IN (%s)' % ','.join('?'*len(types))); args += types
+    rows=c.execute('SELECT * FROM questions WHERE '+(' AND '.join(where) if where else '1=1')+' ORDER BY id', args).fetchall(); c.close()
+    data=[qdict(r) for r in rows]
+    if fmt == 'json': return jsonify(data)
+    if fmt != 'csv': return jsonify({'error':'format必须为csv或json'}),400
+    output=io.StringIO(); writer=csv.writer(output); writer.writerow(['id','type','chapter','score','level','question','answer','options','explanation','source','created_at','updated_at'])
+    for item in data: writer.writerow([item.get(k,'') if k != 'options' else json.dumps(item['options'],ensure_ascii=False) for k in ['id','type','chapter','score','level','question','answer','options','explanation','source','created_at','updated_at']])
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='questions.csv')
+
+@app.route('/api/questions/backup', methods=['GET'])
+@login_required(admin_only=True)
+def backup_questions():
+    c=db(); rows=c.execute('SELECT * FROM questions ORDER BY id').fetchall(); c.close()
+    return send_file(io.BytesIO(json.dumps([qdict(r) for r in rows], ensure_ascii=False, indent=2).encode('utf-8')), mimetype='application/json', as_attachment=True, download_name='questions-backup.json')
+
+@app.route('/api/questions/restore', methods=['POST'])
+@login_required(admin_only=True)
+def restore_questions():
+    data=request.get_json(silent=True)
+    items=data if isinstance(data,list) else (data or {}).get('questions') if isinstance(data,dict) else None
+    if not isinstance(items,list): return jsonify({'error':'备份结构无效'}),400
+    normalized=[]
+    for item in items:
+        q,error=validate_question_payload(item)
+        if error: return jsonify({'error':'备份包含无效题目：'+error}),400
+        normalized.append(q)
+    backup_dir=os.path.join(BASE,'backups'); os.makedirs(backup_dir,exist_ok=True)
+    c=db(); current=[qdict(r) for r in c.execute('SELECT * FROM questions ORDER BY id').fetchall()]
+    backup_path=os.path.join(backup_dir, 'questions-before-restore-'+datetime.now().strftime('%Y%m%d%H%M%S')+'.json')
+    with open(backup_path,'w',encoding='utf-8') as f: json.dump(current,f,ensure_ascii=False,indent=2)
+    try:
+        c.execute('BEGIN'); c.execute('DELETE FROM questions')
+        for q in normalized:
+            c.execute('INSERT INTO questions(type,chapter,score,level,question,answer,options,explanation,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(q['type'],clean(q.get('chapter')) or '未分类',q.get('score',1),clean(q.get('level')),q['question'],q['answer'],json.dumps(q['options'],ensure_ascii=False),clean(q.get('explanation')),clean(q.get('source')) or '备份恢复',now(),now()))
+        c.commit()
+    except Exception:
+        c.rollback(); c.close(); raise
+    c.close(); return jsonify({'ok':True,'restored':len(normalized),'backup':backup_path})
+
+@app.route('/api/import-history')
+@login_required(admin_only=True)
+def import_history():
+    c=db(); rows=c.execute('SELECT b.*,u.username AS admin_username FROM import_batches b LEFT JOIN users u ON u.id=b.admin_id ORDER BY b.id DESC LIMIT 100').fetchall(); c.close(); return jsonify([dict(r) for r in rows])
+
+@app.route('/api/admin/overview-stats')
+@login_required(admin_only=True)
+def overview_stats():
+    c=db(); row=c.execute("SELECT COUNT(*) AS students, COALESCE(SUM(total),0) AS total_questions, COALESCE(SUM(correct),0) AS total_correct, COUNT(r.id) AS attempts FROM users u LEFT JOIN records r ON r.user_id=u.id WHERE u.role='student'").fetchone(); c.close(); return jsonify({'students':row['students'],'attempts':row['attempts'],'total_questions':row['total_questions'],'average_accuracy':round(row['total_correct']/row['total_questions']*100,2) if row['total_questions'] else 0})
+
+@app.route('/api/admin/student-stats')
+@login_required(admin_only=True)
+def student_stats():
+    c=db(); rows=c.execute("SELECT u.id,u.username,COUNT(r.id) attempts,COALESCE(SUM(r.total),0) total_questions,COALESCE(SUM(r.correct),0) total_correct FROM users u LEFT JOIN records r ON r.user_id=u.id WHERE u.role='student' GROUP BY u.id ORDER BY u.username").fetchall(); c.close(); return jsonify([dict(r, accuracy=round(r['total_correct']/r['total_questions']*100,2) if r['total_questions'] else 0) for r in rows])
+
+@app.route('/api/admin/users')
+@login_required(admin_only=True)
+def admin_users():
+    c=db(); rows=c.execute("SELECT id,username,role,created_at FROM users ORDER BY role DESC,username").fetchall(); c.close(); return jsonify([dict(r) for r in rows])
+
+@app.route('/api/admin/users/<int:user_id>/reset-password', methods=['POST'])
+@login_required(admin_only=True)
+def reset_password(user_id):
+    password=clean((request.get_json(silent=True) or {}).get('password'))
+    if len(password)<6: return jsonify({'error':'密码至少6位'}),400
+    c=db(); user=c.execute('SELECT role FROM users WHERE id=?',(user_id,)).fetchone()
+    if not user: c.close(); return jsonify({'error':'用户不存在'}),404
+    if user['role']=='admin': c.close(); return jsonify({'error':'禁止重置管理员密码'}),400
+    c.execute('UPDATE users SET password_hash=? WHERE id=?',(generate_password_hash(password),user_id)); c.commit(); c.close(); return jsonify({'ok':True})
+
 @app.route('/api/records')
 @login_required(admin_only=True)
 def records():
